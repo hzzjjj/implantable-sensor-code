@@ -1,0 +1,180 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import VotingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, RobustScaler
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+import warnings
+
+
+def safe_extract_features(file_path):
+    """Robust feature extraction supporting small files"""
+    try:
+        # Force reading at least 5 rows
+        df = pd.read_csv(file_path, header=None, dtype=np.float64, nrows=5)
+        if df.shape[1] < 2:
+            raise ValueError("CSV file must contain at least 2 columns")
+
+        # Use entire column data to enhance robustness
+        sensor_data = df.iloc[:, 1].dropna().replace([np.inf, -np.inf], np.nan)
+        valid_data_count = len(sensor_data.dropna())
+
+        # Allow minimum 3 valid data points
+        if valid_data_count < 3:
+            raise ValueError(f"Insufficient valid data points ({valid_data_count})")
+
+        # Dynamic feature calculation
+        features = {
+            'mean': np.nanmean(sensor_data),
+            'std': np.nanstd(sensor_data, ddof=1) if valid_data_count > 1 else 0,
+            'max': np.nanmax(sensor_data) if valid_data_count > 0 else 0,
+            'min': np.nanmin(sensor_data) if valid_data_count > 0 else 0,
+            'ptp': np.ptp(sensor_data) if valid_data_count > 0 else 0,
+            'rms': np.sqrt(np.nanmean(np.square(sensor_data))) if valid_data_count > 0 else 0,
+            'zero_cross': len(np.where(np.diff(np.sign(sensor_data)))[0]),
+            'mad': np.nanmean(np.abs(sensor_data - np.nanmean(sensor_data))) if valid_data_count > 0 else 0
+        }
+
+        # Enhanced FFT processing
+        try:
+            fft = np.abs(np.fft.fft(sensor_data))
+            valid_fft = fft[np.isfinite(fft)]
+            features.update({
+                'fft_max': np.max(valid_fft) if len(valid_fft) > 0 else 0,
+                'fft_mean': np.mean(valid_fft) if len(valid_fft) > 0 else 0,
+                'fft_std': np.std(valid_fft, ddof=1) if len(valid_fft) > 1 else 0
+            })
+        except Exception as fft_error:
+            warnings.warn(f"FFT error {os.path.basename(file_path)}: {str(fft_error)}")
+            features.update({'fft_max': 0, 'fft_mean': 0, 'fft_std': 0})
+
+        # Ensure all feature values are finite floats
+        return [float(x) if np.isfinite(x) else 0.0 for x in features.values()]
+
+    except Exception as e:
+        warnings.warn(f"Failed processing file {os.path.basename(file_path)}: {str(e)}")
+        return [0.0] * 11
+
+
+# Configuration
+root_dir = r'C:\Users\Liuhongwei\Desktop\sensordata-responsiveness-25%'
+
+# File collection (all CSVs)
+print("=" * 50)
+print("Starting full directory scan...")
+file_paths = []
+labels = []
+valid_folders = 0
+
+for folder_name in sorted(os.listdir(root_dir)):
+    folder_path = os.path.join(root_dir, folder_name)
+    if os.path.isdir(folder_path) and folder_name.endswith("mA"):
+        valid_folders += 1
+        file_count = 0
+        print(f"\nScanning folder: {folder_name}")
+        for file_name in sorted(os.listdir(folder_path)):
+            if file_name.lower().endswith(".csv"):
+                full_path = os.path.join(folder_path, file_name)
+                try:
+                    # Validate file readability
+                    with open(full_path, 'r') as f:
+                        f.readline()  # Try reading first line
+
+                    file_paths.append(full_path)
+                    labels.append(folder_name)
+                    file_count += 1
+                    print(f"  Loaded: {file_name}")
+                except Exception as e:
+                    print(f"  Corrupted file {file_name}: {str(e)}")
+        print(f"Folder {folder_name} loaded {file_count} files")
+
+print("\n" + "=" * 50)
+print("Scan summary:")
+print(f"Valid folders: {valid_folders}")
+print(f"Total files: {len(file_paths)}")
+print("=" * 50)
+
+# Feature extraction
+print("\nStarting feature extraction...")
+X = []
+valid_files = 0
+for idx, fp in enumerate(file_paths):
+    try:
+        features = safe_extract_features(fp)
+        X.append(features)
+        valid_files += 1
+        print(f"[{idx + 1}/{len(file_paths)}] Successfully extracted {fp}")
+    except Exception as e:
+        print(f"[{idx + 1}/{len(file_paths)}] Error in file {fp}: {str(e)}")
+        X.append([0.0] * 11)  # Keep consistent feature dimension
+
+X = np.array(X)
+y = LabelEncoder().fit_transform(labels)
+
+# Data preprocessing pipeline
+preprocessor = Pipeline([
+    ('imputer', SimpleImputer(strategy='constant', fill_value=0)),  # Handle possible missing values
+    ('scaler', RobustScaler())  # Robust scaling against outliers
+])
+
+# Critical fix: run preprocessing pipeline
+X_processed = preprocessor.fit_transform(X)
+
+# Data splitting
+X_train, X_test, y_train, y_test = train_test_split(
+    X_processed,  # Use preprocessed data
+    y,
+    test_size=0.2,
+    stratify=y,
+    random_state=42
+)
+
+# Classifier setup
+clf1 = LogisticRegression(
+    max_iter=5000,
+    class_weight='balanced',
+    random_state=42
+)
+
+clf2 = RandomForestClassifier(
+    n_estimators=50,
+    max_depth=3,
+    class_weight='balanced',
+    random_state=42
+)
+
+clf3 = SVC(
+    kernel='linear',
+    probability=True,
+    class_weight='balanced',
+    random_state=42
+)
+
+# Ensemble model
+voting_clf = VotingClassifier(
+    estimators=[('lr', clf1), ('rf', clf2), ('svm', clf3)],
+    voting='soft'
+)
+
+# Training and evaluation
+try:
+    voting_clf.fit(X_train, y_train)
+    y_pred = voting_clf.predict(X_test)
+
+    print("\nModel evaluation results:")
+    print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+    print("Classification report:")
+    print(classification_report(y_test, y_pred, target_names=np.unique(labels)))
+
+except Exception as e:
+    print(f"\nTraining failed: {str(e)}")
+    print("Possible reasons:")
+    print("- Insufficient data, please ensure at least 5 samples per class")
+    print("- Features all zeros, please verify file reading correctness")
+    print("- Mismatch between number of classes and samples, check label encoding")
