@@ -1,0 +1,142 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, classification_report
+from scipy.stats import skew, kurtosis
+
+
+def safe_polyfit(x, y, degree):
+    """Robust slope calculation with exception handling"""
+    try:
+        # Check if data length and variance are sufficient and non-constant
+        if len(x) < 2 or np.var(x) < 1e-8 or np.var(y) < 1e-8:
+            return 0.0
+        slope, _ = np.polyfit(x, y, degree)
+        return slope
+    except (np.linalg.LinAlgError, TypeError, ValueError):
+        return 0.0
+
+
+def extract_features(file_path):
+    """Improved feature extraction function"""
+    try:
+        df = pd.read_csv(file_path, header=None)
+        if df.shape[1] < 2 or df.shape[0] < 2:
+            print(f"File {file_path} has insufficient columns/rows")
+            return None
+
+        time = df.iloc[:, 0].values.astype(float)
+        response = df.iloc[:, 1].values.astype(float)
+
+        # Basic statistical features
+        features = [
+            np.mean(response),
+            np.std(response),
+            np.max(response),
+            np.min(response),
+            np.ptp(response),
+            np.sqrt(np.mean(response ** 2)),  # RMS
+            safe_polyfit(time, response, 1),  # Robust slope calculation
+            len(np.where(np.diff(np.sign(response - np.mean(response))))[0]),  # Zero crossing rate
+            skew(response),
+            kurtosis(response)
+        ]
+
+        # Check for invalid values
+        if any(np.isnan(f) or np.isinf(f) for f in features):
+            print(f"File {file_path} contains invalid feature values")
+            return None
+
+        return features
+    except Exception as e:
+        print(f"Error processing file {file_path}: {str(e)}")
+        return None
+
+
+def main():
+    # Set data directory
+    main_folder = r"C:\Users\Liuhongwei\Desktop\sensordata-responsiveness-25%"
+
+    # Collect features and labels
+    features = []
+    labels = []
+    valid_files = 0
+    skipped_files = 0
+
+    # Traverse directories and files
+    for class_name in os.listdir(main_folder):
+        class_dir = os.path.join(main_folder, class_name)
+        if os.path.isdir(class_dir):
+            for file in os.listdir(class_dir):
+                if file.endswith('.csv'):
+                    file_path = os.path.join(class_dir, file)
+                    feature = extract_features(file_path)
+                    if feature is not None:
+                        features.append(feature)
+                        labels.append(class_name)
+                        valid_files += 1
+                    else:
+                        skipped_files += 1
+
+    print(f"\nValid files: {valid_files}, Skipped files: {skipped_files}")
+    if valid_files == 0:
+        print("No valid data available for processing")
+        return
+
+    # Preprocess data
+    X = np.array(features)
+    y = LabelEncoder().fit_transform(labels)
+
+    # Check for sufficient samples per class
+    min_samples = 2  # Minimum samples per class
+    unique_classes, counts = np.unique(y, return_counts=True)
+    if any(counts < min_samples):
+        problematic = [cls for cls, cnt in zip(np.unique(labels), counts) if cnt < min_samples]
+        print(f"\nWarning: Classes with fewer than {min_samples} samples: {problematic}")
+
+    # Split dataset (stratified)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.2,
+        stratify=y,
+        random_state=42
+    )
+
+    # Standardize features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # Configure SVM with optimized parameters
+    svm = SVC(
+        kernel='rbf',
+        C=0.1,  # Reduced regularization strength
+        gamma='scale',
+        class_weight='balanced',  # Handle class imbalance
+        probability=True,
+        random_state=42
+    )
+
+    # Train the model
+    try:
+        svm.fit(X_train_scaled, y_train)
+    except ValueError as e:
+        print(f"Model training failed: {str(e)}")
+        return
+
+    # Evaluate model performance
+    y_pred = svm.predict(X_test_scaled)
+    print(f"\nModel accuracy: {accuracy_score(y_test, y_pred):.4f}")
+    print("\nClassification report:")
+    print(classification_report(
+        y_test, y_pred,
+        target_names=np.unique(labels),
+        zero_division=0  # Handle classes with no predicted samples
+    ))
+
+
+if __name__ == "__main__":
+    main()
