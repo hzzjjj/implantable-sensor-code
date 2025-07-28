@@ -1,0 +1,236 @@
+import matplotlib
+matplotlib.use('TkAgg')
+
+import os
+import re
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    roc_curve,
+    auc
+)
+from scipy.stats import kurtosis, skew
+
+
+# ========================================
+# Configuration
+# ========================================
+class Config:
+    DATA_PATH = r"C:\Users\Liuhongwei\Desktop\sensordata-responsiveness-25%"
+    AUGMENTATION_FACTOR = 3
+    NOISE_LEVEL = 0.02
+    TEST_SIZE = 0.2
+    RANDOM_STATE = 42
+    MODEL_PARAMS = {
+        'n_estimators': 200,
+        'max_depth': 10,
+        'min_samples_split': 5,
+        'class_weight': 'balanced',
+        'n_jobs': -1
+    }
+
+# Set English font (remove Chinese font setting)
+plt.rcParams['font.sans-serif'] = ['Arial']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# ========================================
+# Feature extraction
+# ========================================
+def extract_features(file_path):
+    """Extract statistical features from sensor response data."""
+    try:
+        df = pd.read_csv(file_path, usecols=[0, 1], names=['Time', 'Response'], dtype=float)
+        response = df['Response'].dropna()
+        return {
+            'mean': response.mean(),
+            'std': response.std(),
+            'max': response.max(),
+            'min': response.min(),
+            'median': response.median(),
+            'kurtosis': kurtosis(response),
+            'skewness': skew(response),
+            'rms': np.sqrt(np.mean(response ** 2)),
+            'mav': np.mean(np.abs(response))
+        } if len(response) >= 10 else None
+    except Exception:
+        return None
+
+
+# ========================================
+# Load and preprocess data
+# ========================================
+def load_data(data_path):
+    """Load and preprocess sensor data organized by current levels."""
+    features, labels, groups = [], [], []
+    current_values = []
+
+    # Scan folders and extract current levels
+    folders = [f for f in os.listdir(data_path) if os.path.isdir(os.path.join(data_path, f))]
+    current_pattern = re.compile(r'([\d.]+)mA')
+
+    for folder in folders:
+        match = current_pattern.match(folder)
+        if match:
+            current_values.append(float(match.group(1)))
+    sorted_indices = np.argsort(current_values)
+    sorted_folders = [folders[i] for i in sorted_indices]
+
+    # Load data from sorted folders
+    for folder in sorted_folders:
+        folder_path = os.path.join(data_path, folder)
+        current = float(current_pattern.match(folder).group(1))
+        current_label = f"{current}mA"
+
+        for file in os.listdir(folder_path):
+            if not file.endswith('.csv'):
+                continue
+
+            file_path = os.path.join(folder_path, file)
+            feat = extract_features(file_path)
+            if not feat:
+                continue
+
+            # Original sample
+            features.append(list(feat.values()))
+            labels.append(current_label)
+            groups.append(f"{folder}_{file}")
+
+            # Data augmentation
+            base = np.array(list(feat.values()))
+            for i in range(Config.AUGMENTATION_FACTOR):
+                noise = np.random.normal(0, Config.NOISE_LEVEL * np.abs(base))
+                features.append((base + noise).tolist())
+                labels.append(current_label)
+                groups.append(f"{folder}_{file}_aug{i}")
+
+    return np.array(features), np.array(labels), groups
+
+
+# ========================================
+# Confusion matrix visualization
+# ========================================
+def plot_enhanced_confusion_matrix(y_true, y_pred, classes, fontsize=14):
+    """Plot an enhanced confusion matrix with enlarged text and custom color map."""
+    cm = confusion_matrix(y_true, y_pred)
+
+    green_palette = LinearSegmentedColormap.from_list(
+        'green_gradient', ['#f0fff0', '#98fb98', '#228b22'], N=256)
+
+    fig, ax = plt.subplots(figsize=(12, 10), dpi=100)
+    im = ax.imshow(cm, interpolation='nearest', cmap=green_palette, alpha=0.85)
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+    cbar.ax.tick_params(labelsize=fontsize - 2)
+    cbar.set_label('Sample Count', rotation=270, labelpad=25, fontsize=fontsize)
+
+    ax.set(xticks=np.arange(cm.shape[1]),
+           yticks=np.arange(cm.shape[0]),
+           xticklabels=classes,
+           yticklabels=classes,
+           xlabel='Predicted Label',
+           ylabel='True Label')
+
+    ax.xaxis.label.set_size(fontsize + 15)
+    ax.yaxis.label.set_size(fontsize + 15)
+    ax.tick_params(axis='both', which='major', labelsize=fontsize, length=0)
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor", fontsize=fontsize)
+    plt.setp(ax.get_yticklabels(), fontsize=fontsize)
+
+    thresh = cm.max() / 1.5
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            color = "white" if cm[i, j] > thresh else "black"
+            ax.text(j, i, format(cm[i, j], 'd'),
+                    ha="center", va="center",
+                    color=color,
+                    fontsize=fontsize + 10,
+                    fontweight='bold')
+
+    ax.set_title("Confusion Matrix for Current Classification (mA)", pad=25,
+                 fontsize=fontsize + 15, fontweight='bold')
+    plt.tight_layout()
+    return fig
+
+
+# ========================================
+# ROC curve visualization
+# ========================================
+def plot_multiclass_roc(clf, X_test, y_test, class_names):
+    """Plot multi-class ROC curves."""
+    y_score = clf.predict_proba(X_test)
+    y_test_bin = label_binarize(y_test, classes=np.unique(y_test))
+
+    plt.figure(figsize=(10, 8))
+    colors = plt.colormaps['tab10'].resampled(len(class_names))
+
+    for i in range(len(class_names)):
+        fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_score[:, i])
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, color=colors(i),
+                 label=f'{class_names[i]} (AUC={roc_auc:.2f})')
+
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
+    plt.legend(bbox_to_anchor=(1.3, 0.5))
+    plt.tight_layout()
+    plt.show()
+
+
+# ========================================
+# Main program
+# ========================================
+if __name__ == "__main__":
+    X, labels, groups = load_data(Config.DATA_PATH)
+
+    unique_labels = sorted(np.unique(labels), key=lambda x: float(x.replace('mA', '')))
+
+    le = LabelEncoder()
+    le.classes_ = np.array(unique_labels)
+    y = le.transform(labels)
+
+    splitter = GroupShuffleSplit(test_size=Config.TEST_SIZE, random_state=Config.RANDOM_STATE)
+    train_idx, test_idx = next(splitter.split(X, y, groups=groups))
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    clf = RandomForestClassifier(**Config.MODEL_PARAMS)
+    clf.fit(X_train, y_train)
+
+    y_pred = clf.predict(X_test)
+    print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+    print(classification_report(y_test, y_pred, target_names=unique_labels))
+
+    # Confusion matrix
+    plot_enhanced_confusion_matrix(y_test, y_pred, unique_labels, fontsize=25)
+    plt.show()
+
+    # ROC curve
+    plot_multiclass_roc(clf, X_test, y_test, unique_labels)
+
+    # Feature importance
+    plt.figure(figsize=(10, 6))
+    importances = clf.feature_importances_
+    features_names = list(extract_features(pd.DataFrame(columns=['Time', 'Response'])).keys())
+
+    sorted_idx = np.argsort(importances)[::-1]
+    plt.bar(range(len(importances)), importances[sorted_idx], color='#228b22')
+    plt.xticks(range(len(importances)), np.array(features_names)[sorted_idx], rotation=45)
+    plt.title('Feature Importance Ranking', fontsize=14, pad=15)
+    plt.ylabel('Importance Score', fontsize=12)
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
