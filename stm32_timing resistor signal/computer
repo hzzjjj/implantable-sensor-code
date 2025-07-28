@@ -1,0 +1,72 @@
+import serial
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import matplotlib
+import time
+import csv
+import os
+
+# Configure font (if needed for non-Unicode systems)
+matplotlib.rcParams['font.sans-serif'] = ['Arial']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+# Serial port configuration
+serial_port = 'COM3'       # Modify according to your actual setup
+baud_rate = 115200         # Modify according to your actual setup
+timeout = 1                # Timeout duration in seconds
+
+# Initialize serial connection
+ser = serial.Serial(serial_port, baud_rate, timeout=timeout)
+
+# Data storage
+resistance_data = []
+time_data = []
+start_time = time.time()   # Record start time
+
+# Create data storage folder on desktop
+desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+folder_name = "SensorData"  # Folder name for storing data
+folder_path = os.path.join(desktop_path, folder_name)
+
+# Create the folder if it does not exist
+if not os.path.exists(folder_path):
+    os.makedirs(folder_path)
+
+# Set CSV file path
+csv_file = os.path.join(folder_path, "resistance_data_0414.csv")
+
+# Open CSV file and write header
+with open(csv_file, mode="w", newline="") as file:
+    writer = csv.writer(file)
+    writer.writerow(["Time (s)", "Resistance (Ohms)"])  # Write header
+
+# Initialize plot
+fig, ax = plt.subplots()
+line, = ax.plot([], [], lw=2)
+ax.set_xlim(0, 200)  # Initial time window in seconds
+ax.set_ylim(0, 10)   # Initial resistance range in Ohms
+ax.set_xlabel("Time (s)")
+ax.set_ylabel("Resistance (Ohms)")
+ax.set_title("Real-Time Resistance Monitoring")
+
+# Update function for animation
+def update(frame):
+    global resistance_data, time_data
+    try:
+        while ser.in_waiting:
+            line_data = ser.readline().decode('utf-8', errors='ignore').strip()
+            values = line_data.split()
+            if len(values) == 2:
+                resistance = float(values[0])
+                current_time = time.time() - start_time
+                
+                # Append to data lists
+                resistance_data.append(resistance)
+                time_data.append(current_time)
+
+                # Write data to CSV
+                with open(csv_file, mode="a", newline="") as file:
+                    writer = csv.writer(file)
+                    writer.writerow([current_time, resistance])
+
+                # Keep only the most recent 200 seconds of data
