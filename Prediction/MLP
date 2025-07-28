@@ -1,0 +1,137 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.pipeline import make_pipeline
+import joblib
+import warnings
+from scipy import stats
+
+# Environment configuration
+warnings.filterwarnings("ignore")
+np.random.seed(42)  # Ensure reproducibility
+
+
+def load_all_samples(folder_path):
+    """Load all available samples"""
+    features = []
+    labels = []
+
+    for file in os.listdir(folder_path):
+        if not file.endswith('.csv'):
+            continue
+
+        try:
+            # Improved filename parsing
+            try:
+                capacity = float(file.split('.')[0])
+            except:
+                capacity = float(file.split('.')[0].replace('_', '.'))
+
+            # Read CSV data
+            df = pd.read_csv(
+                os.path.join(folder_path, file),
+                header=None,
+                names=['time', 'value'],
+                dtype={'time': float, 'value': float},
+                on_bad_lines='skip'
+            ).dropna()
+
+            y_values = df['value'].values
+            x = np.arange(len(y_values))
+
+            # Feature engineering
+            features.append({
+                'mean': np.mean(y_values),
+                'std': np.std(y_values),
+                'max': np.max(y_values),
+                'min': np.min(y_values),
+                'median': np.median(y_values),
+                'slope': np.polyfit(x, y_values, 1)[0] if len(x) > 1 else 0,
+                'range': np.ptp(y_values),
+                'q1': np.percentile(y_values, 25),
+                'q3': np.percentile(y_values, 75),
+                'skewness': stats.skew(y_values),
+                'kurtosis': stats.kurtosis(y_values),
+                'zero_cross': len(np.where(np.diff(np.sign(y_values)))[0]),
+                'abs_energy': np.sum(y_values ** 2)
+            })
+            labels.append(capacity)
+
+        except Exception as e:
+            print(f"Error processing file {file}: {str(e)}")
+            continue
+
+    return pd.DataFrame(features), np.array(labels)
+
+
+def main():
+    # Data directory
+    data_path = r"C:\Users\Liuhongwei\Desktop\capacity-forecast"
+
+    print("Loading all data...")
+    X, y = load_all_samples(data_path)
+    print(f"Total samples: {len(X)}")
+
+    # Randomly split dataset (80% train, 20% test)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.2,
+        random_state=42,  # Fix random seed for reproducibility
+        shuffle=True  # Ensure shuffling
+    )
+
+    print(f"\nTraining samples: {len(X_train)} ({len(X_train) / len(X):.0%})")
+    print(f"Testing samples: {len(X_test)} ({len(X_test) / len(X):.0%})")
+
+    # Build MLP model pipeline
+    mlp_model = make_pipeline(
+        MinMaxScaler(),
+        MLPRegressor(
+            hidden_layer_sizes=(32, 16),
+            activation='tanh',
+            solver='lbfgs',
+            alpha=0.01,
+            max_iter=1000,
+            random_state=42,
+            verbose=True
+        )
+    )
+
+    print("\nStarting MLP training...")
+    mlp_model.fit(X_train, y_train)
+
+    # Evaluation function
+    def evaluate(model, X, y_true, set_name):
+        y_pred = model.predict(X)
+        r2 = r2_score(y_true, y_pred)
+        mae = mean_absolute_error(y_true, y_pred)
+        print(f"\n{set_name} set evaluation:")
+        print(f"R² score: {r2:.4f}")
+        print(f"MAE: {mae:.6f}")
+        return y_pred
+
+    print("\n=== Model Performance ===")
+    train_pred = evaluate(mlp_model, X_train, y_train, "Training")
+    test_pred = evaluate(mlp_model, X_test, y_test, "Testing")
+
+    # Save the model
+    model_path = 'mlp_model_random_split.pkl'
+    joblib.dump(mlp_model, model_path)
+    print(f"\nModel saved as {model_path}")
+
+    # Compare predicted vs actual values on test set
+    print("\nTest set actual vs predicted values:")
+    results = pd.DataFrame({
+        'Actual': y_test,
+        'Predicted': test_pred,
+        'Absolute Error': np.abs(y_test - test_pred)
+    })
+    print(results.round(4))
+
+
+if __name__ == "__main__":
+    main()
