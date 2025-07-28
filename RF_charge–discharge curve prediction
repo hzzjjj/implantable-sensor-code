@@ -1,0 +1,160 @@
+import os
+import pandas as pd
+import numpy as np
+from scipy.interpolate import interp1d
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+import glob
+
+# Configuration for plots
+rcParams['font.sans-serif'] = ['SimHei']  # Use a font that supports Unicode
+rcParams['axes.unicode_minus'] = False
+
+
+def find_data_files(folder_path):
+    """Automatically detect resistance and voltage data files."""
+    resistance_files = glob.glob(os.path.join(folder_path, '*resistance*.*'))
+    voltage_files = glob.glob(os.path.join(folder_path, '*voltage*.*'))
+
+    # Prefer .csv files if available
+    resistance_csv = [f for f in resistance_files if f.lower().endswith('.csv')]
+    voltage_csv = [f for f in voltage_files if f.lower().endswith('.csv')]
+
+    resistance_path = resistance_csv[0] if resistance_csv else (resistance_files[0] if resistance_files else None)
+    voltage_path = voltage_csv[0] if voltage_csv else (voltage_files[0] if voltage_files else None)
+
+    return resistance_path, voltage_path
+
+
+def auto_process_data(folder_path):
+    """Automated preprocessing workflow for voltage prediction."""
+    print("=== Automated Battery Voltage Prediction Pipeline ===")
+    print(f"\nProcessing folder: {folder_path}")
+
+    # Step 1: Locate data files
+    print("\n[1/5] Locating data files...")
+    resistance_path, voltage_path = find_data_files(folder_path)
+
+    if not resistance_path or not voltage_path:
+        print("Error: Required data files not found.")
+        print(f"Resistance file: {'Found' if resistance_path else 'Not found'}")
+        print(f"Voltage file: {'Found' if voltage_path else 'Not found'}")
+        return None
+
+    print(f"Resistance file found: {resistance_path}")
+    print(f"Voltage file found: {voltage_path}")
+
+    # Step 2: Load data
+    print("\n[2/5] Loading data...")
+    try:
+        resistance = pd.read_csv(resistance_path, header=None, names=['time', 'resistance'])
+        voltage = pd.read_csv(voltage_path, header=None, names=['time', 'voltage'])
+    except Exception as e:
+        print(f"Failed to load data: {e}")
+        return None
+
+    # Step 3: Preprocess data
+    print("\n[3/5] Preprocessing data...")
+    for df in [resistance, voltage]:
+        df['time'] = pd.to_numeric(df['time'], errors='coerce')
+        df.dropna(inplace=True)
+        df.sort_values('time', inplace=True)
+        df.drop_duplicates('time', keep='first', inplace=True)
+
+    # Synchronize time ranges
+    min_time = max(resistance['time'].min(), voltage['time'].min())
+    max_time = min(resistance['time'].max(), voltage['time'].max())
+
+    resistance = resistance[(resistance['time'] >= min_time) & (resistance['time'] <= max_time)]
+    voltage = voltage[(voltage['time'] >= min_time) & (voltage['time'] <= max_time)]
+
+    # Step 4: Align data
+    print("\n[4/5] Aligning time series data...")
+    common_time = np.linspace(min_time, max_time, min(len(resistance), 2000))
+
+    merged_data = pd.DataFrame({'time': common_time})
+    merged_data['resistance'] = np.interp(common_time, resistance['time'], resistance['resistance'])
+    merged_data['voltage'] = np.interp(common_time, voltage['time'], voltage['voltage'])
+
+    # Feature engineering
+    merged_data['resistance_diff'] = merged_data['resistance'].diff().fillna(0)
+    merged_data['voltage_lag1'] = merged_data['voltage'].shift(1).fillna(method='bfill')
+
+    print(f"\nFinal dataset size: {len(merged_data)} records")
+    return merged_data
+
+
+def train_and_predict(data, output_folder):
+    """Train Random Forest model and perform voltage prediction."""
+    if data is None:
+        return
+
+    print("\n[5/5] Training model and generating predictions...")
+
+    # Prepare features and labels
+    X = data[['resistance', 'resistance_diff', 'voltage_lag1']]
+    y = data['voltage']
+
+    # Split into training and test sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, shuffle=False
+    )
+
+    # Train the model
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+
+    # Predict and evaluate
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    print(f"\nModel Evaluation:")
+    print(f"- Mean Squared Error (MSE): {mse:.6f}")
+    print(f"- R² Score: {r2:.4f}")
+
+    # Create DataFrame with predictions
+    test_indices = data.iloc[-len(y_test):].index
+    prediction_df = pd.DataFrame({
+        'Time': data.loc[test_indices, 'time'],
+        'Actual_Voltage': y_test,
+        'Predicted_Voltage': y_pred
+    })
+
+    # Save predictions
+    csv_path = os.path.join(output_folder, 'voltage_prediction_results.csv')
+    prediction_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+    print(f"\nPrediction results saved to CSV: {csv_path}")
+
+    # Visualization
+    plt.figure(figsize=(12, 6))
+    plt.plot(data['time'], data['voltage'], 'b-', label='Actual')
+    plt.plot(data.iloc[-len(y_test):]['time'], y_pred, 'r--', label='Predicted')
+    plt.xlabel('Time')
+    plt.ylabel('Voltage')
+    plt.title('Voltage Prediction Results')
+    plt.legend()
+    plt.grid(True)
+
+    output_path = os.path.join(output_folder, 'voltage_prediction_plot.png')
+    plt.savefig(output_path, dpi=300)
+    print(f"Prediction plot saved to: {output_path}")
+
+
+if __name__ == "__main__":
+    # Specify path directly
+    data_folder = r"C:\Users\Liuhongwei\Desktop\voltage-forecast"
+    output_folder = data_folder  # Save results to the same folder
+
+    # Verify path exists
+    if not os.path.exists(data_folder):
+        print(f"Error: Specified data folder does not exist - {data_folder}")
+        print("Please ensure the path is correct and the folder exists.")
+    else:
+        processed_data = auto_process_data(data_folder)
+        train_and_predict(processed_data, output_folder)
+
+    print("\nExecution completed.")
