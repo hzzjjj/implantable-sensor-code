@@ -1,0 +1,224 @@
+import os
+import re
+import pandas as pd
+import numpy as np
+import matplotlib
+
+matplotlib.use('Agg')  # Set non-interactive backend
+import matplotlib.pyplot as plt
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
+from warnings import simplefilter
+from sklearn.exceptions import ConvergenceWarning
+
+# Configuration parameters
+root_dir = r'C:\Users\Liuhongwei\Desktop\sensordata-responsiveness'
+AUGMENT_FACTOR = 5
+NOISE_STD = 0.05
+SCALE_RANGE = (0.8, 1.2)
+TIME_WARP_RANGE = (-0.2, 0.2)
+VISUALIZE_AUG = False  # Visualization disabled by default
+SAVE_AUG_IMAGES = True  # Save augmentation images to files
+IMG_SAVE_DIR = "../augmentation_images"
+
+# Create directory for saving images
+if SAVE_AUG_IMAGES and not os.path.exists(IMG_SAVE_DIR):
+    os.makedirs(IMG_SAVE_DIR)
+
+simplefilter("ignore", category=ConvergenceWarning)
+
+
+def load_sorted_folders():
+    pattern = re.compile(r"^(\d+\.?\d*)mA$")
+    folders = []
+    for f in os.listdir(root_dir):
+        full_path = os.path.join(root_dir, f)
+        if os.path.isdir(full_path):
+            match = pattern.match(f)
+            if match:
+                try:
+                    current_value = float(match.group(1))
+                    folders.append((current_value, f))
+                except ValueError:
+                    continue
+    if not folders:
+        raise ValueError("No folders matching the mA format were found")
+    folders.sort(key=lambda x: x[0])
+    return [f[1] for f in folders], {f[1]: f[0] for f in folders}
+
+
+def load_base_data():
+    current_folders, value_mapping = load_sorted_folders()
+    label_mapping = {folder: idx for idx, folder in enumerate(current_folders)}
+
+    file_paths, labels = [], []
+    for folder in current_folders:
+        folder_path = os.path.join(root_dir, folder)
+        for file in os.listdir(folder_path):
+            if file.lower().endswith('.csv'):
+                full_path = os.path.join(folder_path, file)
+                file_paths.append(full_path)
+                labels.append(label_mapping[folder])
+
+    if not file_paths:
+        raise ValueError("No CSV files were found")
+    return file_paths, labels, label_mapping, value_mapping
+
+
+def time_series_augmentation(time_series, sensor_data):
+    augmented = []
+
+    # Gaussian noise augmentation
+    noise = sensor_data + NOISE_STD * np.random.randn(len(sensor_data))
+    augmented.append(noise)
+
+    # Amplitude scaling
+    scaled = sensor_data * np.random.uniform(*SCALE_RANGE)
+    augmented.append(scaled)
+
+    # Time shift augmentation
+    if len(time_series) > 1:
+        time_shift = np.random.uniform(*TIME_WARP_RANGE)
+        new_time = time_series + time_shift
+        augmented.append(np.interp(time_series, new_time, sensor_data))
+
+    # Segment-wise augmentation
+    if len(time_series) > 3:
+        split = np.random.randint(1, len(time_series) - 1)
+        part1 = sensor_data[:split]
+        part2 = sensor_data[split:] * np.random.uniform(0.7, 1.3)
+        augmented.append(np.concatenate([part1, part2]))
+
+    return augmented[:AUGMENT_FACTOR]
+
+
+def save_augmentation_image(original, augmented, filename):
+    """Save augmentation plots to files"""
+    plt.figure(figsize=(10, 4))
+    plt.plot(original, 'b-', lw=2, label='Original')
+    colors = ['r', 'g', 'm', 'c']
+    for i, aug in enumerate(augmented[:4]):
+        plt.plot(aug, colors[i % 4] + '--', alpha=0.6, label=f'Augmented {i + 1}')
+    plt.title(os.path.basename(filename))
+    plt.legend()
+    save_path = os.path.join(IMG_SAVE_DIR, f"{os.path.splitext(filename)[0]}.png")
+    plt.savefig(save_path)
+    plt.close()
+
+
+def extract_features(file_path):
+    try:
+        df = pd.read_csv(file_path, header=None)
+        time_series = df.iloc[:, 0].values
+        sensor_data = df.iloc[:, 1].values
+
+        # Save augmentation example images
+        if SAVE_AUG_IMAGES and np.random.rand() < 0.1:
+            aug_samples = time_series_augmentation(time_series, sensor_data)
+            save_augmentation_image(sensor_data, aug_samples, os.path.basename(file_path))
+
+        # Feature calculation
+        def calculate_features(data):
+            features = [
+                np.mean(data), np.std(data),
+                np.max(data), np.min(data),
+                np.median(data),
+                np.percentile(data, 25),
+                np.percentile(data, 75),
+                np.mean(np.diff(data)),
+                np.std(np.diff(data)),
+                np.polyfit(time_series, data, 1)[0]
+            ]
+            return features
+
+        features = [calculate_features(sensor_data)]
+        for aug_data in time_series_augmentation(time_series, sensor_data):
+            features.append(calculate_features(aug_data))
+
+        return features
+
+    except Exception as e:
+        print(f"File processing failed {os.path.basename(file_path)}: {str(e)}")
+        return None
+
+
+# Main program
+try:
+    file_paths, labels, label_mapping, value_mapping = load_base_data()
+
+    X, y = [], []
+    for path, label in zip(file_paths, labels):
+        feats = extract_features(path)
+        if feats:
+            X.extend(feats)
+            y.extend([label] * len(feats))
+
+    X = np.array(X)
+    y = np.array(y)
+    print(f"Processed dataset shape: {X.shape}")
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y,
+        test_size=0.3,
+        stratify=y,
+        random_state=42
+    )
+
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(y_train),
+        y=y_train
+    )
+    weight_dict = {i: w for i, w in enumerate(class_weights)}
+
+    mlp = MLPClassifier(
+        hidden_layer_sizes=(256, 128, 64),
+        activation='tanh',
+        solver='adam',
+        alpha=0.001,
+        learning_rate='adaptive',
+        learning_rate_init=0.001,
+        max_iter=3000,
+        early_stopping=True,
+        random_state=42
+    )
+    mlp.class_weight = weight_dict
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True)
+    best_score = 0
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train)):
+        X_tr, X_val = X_train[train_idx], X_train[val_idx]
+        y_tr, y_val = y_train[train_idx], y_train[val_idx]
+
+        mlp.fit(X_tr, y_tr)
+        val_score = mlp.score(X_val, y_val)
+        print(f"Fold {fold + 1} | Validation accuracy: {val_score:.4f}")
+
+        if val_score > best_score:
+            best_score = val_score
+            mlp.fit(np.vstack([X_tr, X_val]), np.concatenate([y_tr, y_val]))
+
+    y_pred = mlp.predict(X_test)
+
+    print("\nEvaluation results:")
+    print(f"Test set accuracy: {accuracy_score(y_test, y_pred):.4f}")
+    print("Classification report:")
+    print(classification_report(y_test, y_pred,
+                                target_names=label_mapping.keys(),
+                                zero_division=0))
+
+    print("Confusion matrix:")
+    print(confusion_matrix(y_test, y_pred))
+
+except Exception as e:
+    print(f"Error occurred: {str(e)}")
+    print("Debug suggestions:")
+    print("1. Verify that CSV files contain two numeric columns")
+    print("2. Confirm folder naming follows the pattern like '1.5mA'")
+    print("3. Consider reducing the AUGMENT_FACTOR parameter")
