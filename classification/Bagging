@@ -1,0 +1,108 @@
+import os
+import pandas as pd
+import numpy as np
+from scipy.signal import find_peaks
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import BaggingClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import accuracy_score, classification_report
+
+
+def extract_features(file_path):
+    """Extract time-domain features from CSV file"""
+    data = pd.read_csv(file_path, header=None, names=['time', 'response'])
+    response = data['response'].values
+    time = data['time'].values
+
+    features = {}
+
+    # Basic statistical features
+    features['mean'] = np.mean(response)
+    features['std'] = np.std(response)
+    features['max'] = np.max(response)
+    features['min'] = np.min(response)
+    features['peak_to_peak'] = features['max'] - features['min']
+    features['median'] = np.median(response)
+    features['rms'] = np.sqrt(np.mean(response ** 2))  # Root Mean Square
+    features['skew'] = pd.Series(response).skew()  # Skewness
+    features['kurtosis'] = pd.Series(response).kurtosis()  # Kurtosis
+
+    # Difference features
+    response_diff = np.diff(response)
+    if len(response_diff) > 0:
+        features['diff_mean'] = np.mean(response_diff)
+        features['diff_std'] = np.std(response_diff)
+    else:
+        features['diff_mean'] = 0
+        features['diff_std'] = 0
+
+    # Peak features
+    peaks, _ = find_peaks(response, height=0)
+    features['num_peaks'] = len(peaks)
+
+    # Rise time feature
+    max_idx = np.argmax(response)
+    min_idx = np.argmin(response)
+    features['rise_time'] = time[max_idx] - time[min_idx] if max_idx > min_idx else 0
+
+    # Integral feature (updated to avoid deprecation warning)
+    try:
+        features['integral'] = np.trapezoid(response, time)  # Use trapezoid integration
+    except:
+        features['integral'] = 0
+
+    return features
+
+
+# Data preparation
+root_dir = r'C:\Users\Liuhongwei\Desktop\sensordata-responsiveness-25%'  # Replace with your actual path
+file_paths = []
+labels = []
+
+# Collect data by traversing folders
+for dir_name in os.listdir(root_dir):
+    dir_path = os.path.join(root_dir, dir_name)
+    if os.path.isdir(dir_path):
+        for file_name in os.listdir(dir_path):
+            if file_name.endswith('.csv'):
+                file_paths.append(os.path.join(dir_path, file_name))
+                labels.append(dir_name)  # Use folder name as label
+
+# Feature extraction
+all_features = []
+for fp in file_paths:
+    all_features.append(extract_features(fp))
+
+features_df = pd.DataFrame(all_features).fillna(0)
+X = features_df.values
+
+# Label encoding
+le = LabelEncoder()
+y = le.fit_transform(labels)
+
+# Data standardization
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# Split dataset
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y
+)
+
+# Initialize and train Bagging classifier (fixed parameter name)
+base_clf = DecisionTreeClassifier(max_depth=5, random_state=42)
+bagging_clf = BaggingClassifier(
+    estimator=base_clf,  # Parameter name corrected to estimator
+    n_estimators=50,
+    random_state=42
+)
+bagging_clf.fit(X_train, y_train)
+
+# Prediction and evaluation
+y_pred = bagging_clf.predict(X_test)
+accuracy = accuracy_score(y_test, y_pred)
+
+print(f"Model accuracy: {accuracy:.4f}")
+print("\nClassification report:")
+print(classification_report(y_test, y_pred, target_names=le.classes_))
