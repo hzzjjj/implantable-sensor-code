@@ -1,0 +1,186 @@
+import matplotlib
+matplotlib.use('TkAgg')
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Configure font for Windows system
+plt.rcParams['font.sans-serif'] = ['SimHei']  # Use SimHei font for Chinese characters if needed
+plt.rcParams['axes.unicode_minus'] = False  # Fix minus sign display
+
+def extract_features(sequence):
+    """Convert time series to fixed-length response feature vector (unchanged)"""
+    time = sequence[:, 0]
+    response = sequence[:, 1]
+
+    features = [
+        np.mean(response), np.std(response),
+        np.min(response), np.max(response),
+        np.ptp(response), np.median(response),
+        np.mean(np.abs(np.diff(response))),
+        np.polyfit(time, response, 1)[0]
+    ]
+
+    q75, q25 = np.percentile(response, [75, 25])
+    features.extend([
+        q75 - q25,
+        (np.max(response) - np.min(response)) / np.mean(response),
+        len(np.where(np.diff(np.sign(response - np.mean(response))))[0])
+    ])
+
+    return np.array(features)
+
+class CurrentDataset:
+    # Keep unchanged
+    def __init__(self, folder_path):
+        self.features = []
+        self.labels = []
+        self._load_data(folder_path)
+
+    def _load_data(self, folder_path):
+        print(f"Loading response data from {folder_path}...")
+        for folder_name in os.listdir(folder_path):
+            folder_full_path = os.path.join(folder_path, folder_name)
+            if os.path.isdir(folder_full_path):
+                self._process_folder(folder_full_path, folder_name)
+
+        if len(self.features) == 0:
+            raise ValueError("No valid data files found")
+        print(f"Successfully loaded {len(self.features)} response samples")
+
+    def _process_folder(self, folder_path, folder_name):
+        if not folder_name.endswith("mA"):
+            print(f"Skipping invalid folder format: {folder_name}")
+            return
+
+        try:
+            current_label = folder_name
+            _ = float(folder_name[:-2])  # Validate current format
+        except ValueError:
+            print(f"Invalid current value format: {folder_name}")
+            return
+
+        for file_name in os.listdir(folder_path):
+            if file_name.endswith(".csv"):
+                file_path = os.path.join(folder_path, file_name)
+                try:
+                    df = pd.read_csv(file_path, header=None)
+                    if df.shape[1] == 2:
+                        sequence = df.values.astype(np.float32)
+                        features = extract_features(sequence)
+                        self.features.append(features)
+                        self.labels.append(current_label)
+                except Exception as e:
+                    print(f"Failed to load file {file_name}: {str(e)}")
+
+def main():
+    # Initialize dataset
+    dataset = CurrentDataset(r'C:\Users\Liuhongwei\Desktop\sensordata-responsiveness')
+
+    # Convert to numpy arrays
+    features = np.array(dataset.features)
+    labels = np.array(dataset.labels)
+
+    # --- Key modification: sort labels by current values ---
+    unique_currents = np.unique(labels)
+    sorted_currents = sorted(unique_currents,
+                             key=lambda x: float(x.replace('mA', '')))
+
+    # Create LabelEncoder fitted by sorted current values
+    le = LabelEncoder()
+    le.fit(sorted_currents)  # Important: fit in sorted order
+    encoded_labels = le.transform(labels)
+    # -----------------------------------
+
+    # Verify label encoding mapping
+    print("\nClass label mapping:")
+    for idx, class_name in enumerate(le.classes_):
+        print(f"{class_name} => {idx}")
+
+    # Initialize 5-fold cross-validation
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    fold_accuracies = []
+    conf_matrices = []
+    class_reports = []
+    all_labels = np.arange(len(le.classes_))
+
+    print("\nStarting 5-fold cross-validation...")
+    for fold, (train_idx, test_idx) in enumerate(kf.split(features), 1):
+        # Split data
+        X_train, X_test = features[train_idx], features[test_idx]
+        y_train, y_test = encoded_labels[train_idx], encoded_labels[test_idx]
+
+        # Feature standardization
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        # Train model
+        knn_model = KNeighborsClassifier(n_neighbors=3)
+        knn_model.fit(X_train_scaled, y_train)
+
+        # Predict and evaluate
+        y_pred = knn_model.predict(X_test_scaled)
+        fold_acc = accuracy_score(y_test, y_pred)
+
+        # Store results
+        fold_accuracies.append(fold_acc)
+        conf_matrices.append(confusion_matrix(y_test, y_pred, labels=all_labels))
+        class_reports.append(
+            classification_report(
+                y_test, y_pred,
+                target_names=le.classes_,
+                labels=all_labels,
+                output_dict=True,
+                zero_division=0
+            )
+        )
+
+        print(f"Fold {fold} - Accuracy: {fold_acc:.4f}")
+
+    # Summary of cross-validation results
+    print("\nCross-validation summary:")
+    print(f"Mean accuracy: {np.mean(fold_accuracies):.4f} ± {np.std(fold_accuracies):.4f}")
+
+    # Visualize confusion matrix of first fold (sorted)
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(conf_matrices[0],
+                annot=True,
+                fmt="d",
+                xticklabels=le.classes_,
+                yticklabels=le.classes_,
+                cmap='Blues',
+                annot_kws={"size": 12})
+    plt.title("Confusion Matrix of First Fold (Sorted by Current)", fontsize=14)
+    plt.xlabel("Predicted Label", fontsize=12)
+    plt.ylabel("True Label", fontsize=12)
+    plt.xticks(rotation=45, fontsize=10)
+    plt.yticks(rotation=0, fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+    # Aggregate classification report metrics
+    metric_names = ['precision', 'recall', 'f1-score']
+    class_metrics = {cls: {m: [] for m in metric_names} for cls in le.classes_}
+
+    for report in class_reports:
+        for cls in le.classes_:
+            for metric in metric_names:
+                class_metrics[cls][metric].append(report[cls][metric])
+
+    # Print average classification report sorted by current
+    print("\nAverage Classification Report (Sorted by Current):")
+    for cls in le.classes_:
+        print(f"\nClass {cls}:")
+        print(f"  Precision: {np.mean(class_metrics[cls]['precision']):.4f}")
+        print(f"  Recall:    {np.mean(class_metrics[cls]['recall']):.4f}")
+        print(f"  F1-Score:  {np.mean(class_metrics[cls]['f1-score']):.4f}")
+
+if __name__ == "__main__":
+    main()
