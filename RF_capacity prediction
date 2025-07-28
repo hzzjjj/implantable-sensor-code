@@ -1,0 +1,277 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV, learning_curve
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+import seaborn as sns
+import joblib
+import matplotlib.font_manager as fm
+from pathlib import Path
+from scipy import signal
+from scipy.interpolate import interp1d
+
+# 1. Set font for cross-platform compatibility
+def set_font():
+    """Set appropriate font to support multilingual characters."""
+    try:
+        font_path = None
+        possible_fonts = [
+            'SimHei.ttf',
+            'msyh.ttc',
+            'STHeiti.ttf',
+            'NotoSansCJK-Regular.ttc'
+        ]
+        for font in possible_fonts:
+            try:
+                if Path(font).exists():
+                    font_path = font
+                    break
+                for f in fm.findSystemFonts():
+                    if font.lower() in f.lower():
+                        font_path = f
+                        break
+            except:
+                continue
+        if font_path:
+            font_prop = fm.FontProperties(fname=font_path)
+            rcParams['font.family'] = font_prop.get_name()
+            print(f"Font successfully set: {font_prop.get_name()}")
+        else:
+            rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'Microsoft YaHei']
+            print("Using default font configuration.")
+        rcParams['axes.unicode_minus'] = False
+    except Exception as e:
+        print(f"Failed to set font: {str(e)}. Default will be used.")
+
+set_font()
+
+# 2. Data augmentation for time series
+def augment_data(df, num_augments=2):
+    """Augment a single time series with various techniques."""
+    augmented_dfs = []
+    x = df['time'].values
+    y = df['value'].values
+
+    augmented_dfs.append(df.copy())
+
+    for _ in range(num_augments):
+        noisy = y + np.random.normal(0, 0.01 * y.std(), len(y))
+        noisy_df = df.copy()
+        noisy_df['value'] = np.clip(noisy, y.min(), y.max())
+        augmented_dfs.append(noisy_df)
+
+    for _ in range(num_augments):
+        scale = np.random.uniform(0.8, 1.2)
+        new_x = x * scale
+        f = interp1d(new_x, y, kind='linear', fill_value='extrapolate')
+        warped_df = df.copy()
+        warped_df['value'] = f(x)
+        augmented_dfs.append(warped_df)
+
+    for _ in range(num_augments):
+        scale = np.random.uniform(0.9, 1.1)
+        scaled_df = df.copy()
+        scaled_df['value'] = y * scale
+        augmented_dfs.append(scaled_df)
+
+    return augmented_dfs
+
+# 3. Load data with optional augmentation
+def load_data_with_augmentation(folder_path, window_pct=0.1, augment=False):
+    """Load and optionally augment time-series data from CSV files."""
+    features = []
+    labels = []
+
+    for file in [f for f in os.listdir(folder_path) if f.endswith('.csv')]:
+        try:
+            capacity = float(file.replace('.csv', ''))
+            df = pd.read_csv(os.path.join(folder_path, file),
+                             header=None,
+                             names=['time', 'value'])
+
+            dfs = augment_data(df) if augment else [df]
+
+            for data in dfs:
+                window_size = max(1, int(len(data) * window_pct))
+                window_data = data.iloc[:window_size]
+                value_diff = np.diff(window_data['value'])
+
+                features.append({
+                    'initial': window_data['value'].iloc[0],
+                    'mean': window_data['value'].mean(),
+                    'std': window_data['value'].std(),
+                    'slope': np.polyfit(window_data['time'], window_data['value'], 1)[0],
+                    'max_diff': value_diff.max(),
+                    'min_diff': value_diff.min(),
+                    'abs_energy': np.sum(window_data['value'] ** 2),
+                    'q25': np.percentile(window_data['value'], 25),
+                    'q75': np.percentile(window_data['value'], 75),
+                    'entropy': np.log(np.var(window_data['value']) + 1e-8),
+                    'zero_cross': ((value_diff[:-1] * value_diff[1:]) < 0).sum(),
+                    'trend_strength': np.abs(np.polyfit(window_data['time'], window_data['value'], 1)[0]) /
+                                      (window_data['value'].std() + 1e-8)
+                })
+                labels.append(capacity)
+        except Exception as e:
+            print(f"Error processing file {file}: {str(e)}")
+            continue
+
+    return pd.DataFrame(features), np.array(labels)
+
+# 4. Main function
+def main():
+    data_path = r"C:\Users\Liuhongwei\Desktop\capacity-forecast"
+    print("Loading original dataset...")
+    X_orig, y_orig = load_data_with_augmentation(data_path, window_pct=0.1, augment=False)
+    print(f"Original sample count: {len(X_orig)}")
+
+    print("\nLoading augmented dataset...")
+    X_aug, y_aug = load_data_with_augmentation(data_path, window_pct=0.1, augment=True)
+    print(f"Augmented sample count: {len(X_aug)}")
+    print(f"Augmentation factor: {len(X_aug) / len(X_orig):.1f}x")
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_aug)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_aug, test_size=0.2, random_state=42)
+
+    print("\nTraining Random Forest model...")
+    rf_model = RandomForestRegressor(random_state=42, n_jobs=-1)
+
+    param_grid = {
+        'n_estimators': [100, 200, 300],
+        'max_depth': [None, 10, 20, 30],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4],
+        'max_features': ['sqrt', 'log2', 0.5]
+    }
+
+    grid_search = GridSearchCV(estimator=rf_model,
+                               param_grid=param_grid,
+                               cv=5,
+                               scoring='r2',
+                               n_jobs=1,
+                               verbose=2)
+    grid_search.fit(X_train, y_train)
+    best_rf = grid_search.best_estimator_
+
+    y_pred = best_rf.predict(X_test)
+    r2 = r2_score(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+
+    print("\n=== Model Evaluation ===")
+    print(f"Best Parameters: {grid_search.best_params_}")
+    print(f"Test R² Score: {r2:.4f}")
+    print(f"Test MAE: {mae:.4f}")
+    print(f"Test MSE: {mse:.4f}")
+    print(f"Test RMSE: {rmse:.4f}")
+
+    feature_importance = best_rf.feature_importances_
+    sorted_idx = np.argsort(feature_importance)[::-1]
+
+    plt.figure(figsize=(12, 8))
+    sns.barplot(x=feature_importance[sorted_idx],
+                y=X_aug.columns[sorted_idx],
+                hue=X_aug.columns[sorted_idx],
+                palette="viridis",
+                dodge=False,
+                legend=False)
+    plt.title("Feature Importance Ranking")
+    plt.xlabel("Importance Score")
+    plt.ylabel("Feature")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    joblib.dump(best_rf, 'optimized_rf_model.pkl')
+    joblib.dump(scaler, 'scaler.pkl')
+    print("\nModel saved as optimized_rf_model.pkl")
+
+    plt.figure(figsize=(10, 8))
+    plt.scatter(y_test, y_pred, alpha=0.6, color='royalblue')
+    plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', linewidth=2)
+    plt.xlabel("True Value")
+    plt.ylabel("Predicted Value")
+    plt.title(f"Predicted vs True (R² = {r2:.3f})")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('prediction_plot.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    residuals = y_test - y_pred
+    plt.figure(figsize=(10, 6))
+    sns.histplot(residuals, kde=True, color='teal', bins=20)
+    plt.xlabel("Residual")
+    plt.ylabel("Frequency")
+    plt.title("Residual Distribution")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('residuals_dist.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+    def plot_learning_curve(estimator, title, X, y, ylim=None, cv=5,
+                            n_jobs=-1, train_sizes=np.linspace(.1, 1.0, 5)):
+        plt.figure(figsize=(10, 6))
+        plt.title(title)
+        if ylim is not None:
+            plt.ylim(*ylim)
+        plt.xlabel("Number of Training Samples")
+        plt.ylabel("Model Score (R²)")
+
+        train_sizes, train_scores, test_scores = learning_curve(
+            estimator, X, y, cv=cv, n_jobs=n_jobs, train_sizes=train_sizes,
+            scoring='r2')
+
+        train_scores_mean = np.mean(train_scores, axis=1)
+        train_scores_std = np.std(train_scores, axis=1)
+        test_scores_mean = np.mean(test_scores, axis=1)
+        test_scores_std = np.std(test_scores, axis=1)
+
+        learning_curve_df = pd.DataFrame({
+            'Training_Samples': train_sizes,
+            'Train_Score_Mean': train_scores_mean,
+            'Train_Score_Upper': train_scores_mean + train_scores_std,
+            'Train_Score_Lower': train_scores_mean - train_scores_std,
+            'Test_Score_Mean': test_scores_mean,
+            'Test_Score_Upper': test_scores_mean + test_scores_std,
+            'Test_Score_Lower': test_scores_mean - test_scores_std
+        })
+        learning_curve_df.to_csv('learning_curve_data.csv', index=False, encoding='utf-8-sig')
+
+        plt.grid(True, alpha=0.3)
+        plt.fill_between(train_sizes, train_scores_mean - train_scores_std,
+                         train_scores_mean + train_scores_std, alpha=0.1, color="r")
+        plt.fill_between(train_sizes, test_scores_mean - test_scores_std,
+                         test_scores_mean + test_scores_std, alpha=0.1, color="g")
+        plt.plot(train_sizes, train_scores_mean, 'o-', color="r", label="Training Score")
+        plt.plot(train_sizes, test_scores_mean, 'o-', color="g", label="Cross-Validation Score")
+
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.savefig('learning_curve.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    print("\nPlotting learning curve...")
+    plot_learning_curve(best_rf, "Random Forest Learning Curve", X_train, y_train)
+    print("Learning curve data saved as learning_curve_data.csv")
+
+    scatter_data = pd.DataFrame({
+        'True Value': y_test,
+        'Predicted Value': y_pred,
+        'Residual': y_test - y_pred
+    })
+    scatter_data.to_csv('prediction_scatter_data.csv', index=False, encoding='utf-8-sig')
+    print("\nScatter plot data saved as prediction_scatter_data.csv")
+
+    print("\nAll analysis completed.")
+
+if __name__ == "__main__":
+    main()
