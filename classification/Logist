@@ -1,0 +1,177 @@
+import os
+import pandas as pd
+import numpy as np
+from scipy.stats import skew, kurtosis
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (accuracy_score,
+                             confusion_matrix,
+                             classification_report)
+from sklearn.exceptions import ConvergenceWarning
+from joblib import Parallel, delayed
+import warnings
+
+# Disable scientific notation display
+np.set_printoptions(suppress=True)
+
+def safe_skew(values):
+    """Safe skewness calculation"""
+    try:
+        return skew(values) if len(values) >= 3 else 0.0
+    except:
+        return 0.0
+
+def safe_kurtosis(values):
+    """Safe kurtosis calculation"""
+    try:
+        return kurtosis(values) if len(values) >= 4 else 0.0
+    except:
+        return 0.0
+
+def safe_polyfit(time, values):
+    """Safe slope calculation"""
+    try:
+        if len(time) < 2 or np.ptp(time) < 1e-6:
+            return 0.0
+        return np.polyfit(time, values, 1)[0]
+    except:
+        return 0.0
+
+def extract_features(file_path):
+    """Feature extraction with forced retention of all samples"""
+    try:
+        # Read data
+        df = pd.read_csv(file_path, header=None)
+
+        # Handle empty files
+        if df.empty:
+            return [0.0] * 12  # Return all-zero features
+
+        # Ensure at least two columns
+        if df.shape[1] < 2:
+            df = pd.concat([df, pd.Series([0] * len(df))], axis=1)
+
+        # Convert to float
+        values = df.iloc[:, 1].astype(float).values
+        time = df.iloc[:, 0].astype(float).values
+
+        # Handle single-value case
+        if len(values) == 1:
+            values = np.concatenate([values, [values[0]]])  # Duplicate value
+            time = np.concatenate([time, [time[0]]])
+
+        # Calculate basic features
+        feature_dict = {
+            'mean': np.nanmean(values),
+            'std': np.nanstd(values, ddof=1),
+            'max': np.nanmax(values),
+            'min': np.nanmin(values),
+            'ptp': np.nanmax(values) - np.nanmin(values),
+            'median': np.nanmedian(values),
+            'rms': np.sqrt(np.nanmean(np.square(values))),
+            'skew': safe_skew(values),
+            'kurtosis': safe_kurtosis(values),
+            'q25': np.nanquantile(values, 0.25),
+            'q75': np.nanquantile(values, 0.75),
+            'slope': safe_polyfit(time, values)
+        }
+
+        # Replace all possible NaNs with 0
+        features = [0.0 if np.isnan(v) else v for v in feature_dict.values()]
+
+        return features
+
+    except Exception as e:
+        print(f"Critical error in file {file_path}, using zero features instead: {str(e)}")
+        return [0.0] * 12
+
+# Configuration parameters
+root_dir = r'C:\Users\Liuhongwei\Desktop\sensordata-responsiveness-25%'
+test_size = 0.2
+random_state = 42
+
+# Parallel processing files
+features = []
+labels = []
+
+for current_dir in os.listdir(root_dir):
+    dir_path = os.path.join(root_dir, current_dir)
+
+    if os.path.isdir(dir_path):
+        print(f"Processing directory: {current_dir}")
+
+        file_paths = [os.path.join(dir_path, f)
+                      for f in os.listdir(dir_path)
+                      if f.endswith(".csv")]
+
+        results = Parallel(n_jobs=-1)(
+            delayed(extract_features)(fp) for fp in file_paths
+        )
+
+        # Force retention of all samples
+        features.extend(results)
+        labels.extend([current_dir] * len(results))
+
+# Convert data format
+X = np.array(features)
+y = LabelEncoder().fit_transform(labels)
+
+# Data cleaning report
+print("\nData cleaning report:")
+print(f"Number of NaNs in original feature matrix: {np.isnan(X).sum()}")
+X = np.nan_to_num(X, nan=0.0)  # Force replace all NaNs
+
+# Data standardization
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Split dataset
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y,
+    test_size=test_size,
+    random_state=random_state,
+    stratify=y
+)
+
+# Model parameter tuning
+model = LogisticRegression(
+    penalty='l2',
+    C=0.5,  # Adjust regularization strength
+    max_iter=10000,
+    solver='saga',
+    class_weight='balanced',
+    random_state=42
+)
+
+# Train model
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+    model.fit(X_train, y_train)
+
+# Feature importance analysis (after standardization)
+print("\nFeature importance analysis (absolute standardized coefficients):")
+feature_names = [
+    'Mean', 'Std', 'Max', 'Min', 'Peak-to-Peak',
+    'Median', 'RMS', 'Skewness', 'Kurtosis',
+    'Q25', 'Q75', 'Slope'
+]
+importance = np.abs(model.coef_).mean(axis=0)
+
+for name, imp in zip(feature_names, importance):
+    print(f"{name:<15}: {imp:.4f}")
+
+# Model evaluation
+y_pred = model.predict(X_test)
+print("\nModel Evaluation:")
+print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred, digits=4))  # All metrics with 4 decimals
+
+# Save model
+import joblib
+joblib.dump(model, "sensor_model.pkl")
+joblib.dump(scaler, "scaler.pkl")
+print("\nModel saved as sensor_model.pkl")
