@@ -1,0 +1,97 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import r2_score, mean_absolute_error
+import joblib
+import warnings
+
+# Set random seed for reproducibility
+np.random.seed(42)
+warnings.filterwarnings("ignore")
+
+
+def load_and_process_data(folder_path):
+    """Load data and extract features"""
+    features = []
+    labels = []
+
+    for file in os.listdir(folder_path):
+        if not file.endswith('.csv'):
+            continue
+
+        try:
+            # Extract capacity value from filename
+            capacity = float(file.split('.')[0])
+
+            # Read CSV file
+            df = pd.read_csv(os.path.join(folder_path, file),
+                             header=None,
+                             names=['time', 'value'],
+                             dtype={'time': float, 'value': float})
+
+            # Basic feature extraction
+            window = df.iloc[:100]  # Use first 100 points as sample
+            features.append({
+                'mean': window['value'].mean(),
+                'std': window['value'].std(),
+                'slope': np.polyfit(np.arange(len(window)), window['value'], 1)[0],
+                'max_value': window['value'].max(),
+                'min_value': window['value'].min(),
+                'range': window['value'].max() - window['value'].min()
+            })
+            labels.append(capacity)
+
+        except Exception as e:
+            print(f"Skipping file {file}: {str(e)}")
+
+    return pd.DataFrame(features), np.array(labels)
+
+
+def main():
+    # Data directory
+    data_path = r"C:\Users\Liuhongwei\Desktop\capacity-forecast"
+
+    # Load data
+    print("Loading data...")
+    X, y = load_and_process_data(data_path)
+    print(f"Total samples: {len(X)}")
+
+    # Split data randomly into train and test sets (80% train, 20% test)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42)
+
+    print(f"\nTraining samples: {len(X_train)}")
+    print(f"Testing samples: {len(X_test)}")
+
+    # Initialize model
+    model = HistGradientBoostingRegressor(
+        max_iter=200,
+        learning_rate=0.1,
+        max_depth=5,
+        min_samples_leaf=5,
+        random_state=42
+    )
+
+    # Train model
+    print("\nTraining model...")
+    model.fit(X_train, y_train)
+
+    # Evaluate model
+    train_pred = model.predict(X_train)
+    test_pred = model.predict(X_test)
+
+    print("\n=== Model Performance ===")
+    print(f"Training R²: {r2_score(y_train, train_pred):.3f}")
+    print(f"Training MAE: {mean_absolute_error(y_train, train_pred):.4f}")
+    print(f"Testing R²: {r2_score(y_test, test_pred):.3f}")
+    print(f"Testing MAE: {mean_absolute_error(y_test, test_pred):.4f}")
+
+    # Save model
+    joblib.dump(model, 'capacity_predictor.pkl')
+    print("\nModel saved as capacity_predictor.pkl")
+
+
+if __name__ == "__main__":
+    main()
